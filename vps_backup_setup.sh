@@ -1,17 +1,19 @@
 #!/usr/bin/env bash
 # ==============================================================================
-#  VPS + PTERODACTYL BACKUP SETUP  v4
+#  VPS + PTERODACTYL BACKUP SETUP  v5
 #
+#  ✔ Works when piped through curl (no TTY issue)
 #  ✔ Timer uses OnCalendar — fires every 3h reliably
 #  ✔ Keeps last 2 backups, oldest auto-deleted correctly
-#  ✔ GitHub (PUBLIC repo) — rclone config encrypted with a password before upload
-#  ✔ New VPS setup = one curl command, just enter your password
+#  ✔ GitHub (PUBLIC repo) + AES-256 encrypted rclone config
 #
-#  FIRST TIME:
-#    sudo bash vps_backup_setup.sh
+#  FIRST TIME (download and run directly):
+#    curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/vps_backup_setup.sh -o setup.sh
+#    sudo bash setup.sh
 #
-#  ANY NEW VPS AFTER THAT:
-#    curl -fsSL https://raw.githubusercontent.com/YOUR_USER/YOUR_REPO/main/vps_backup_setup.sh | sudo bash -s -- --from-github
+#  NEW VPS (after first time setup):
+#    curl -fsSL https://raw.githubusercontent.com/USER/REPO/main/vps_backup_setup.sh -o setup.sh
+#    sudo bash setup.sh --from-github
 # ==============================================================================
 
 set -euo pipefail
@@ -41,7 +43,6 @@ SVC="vps-rclone-backup"
 RCLONE_CONF="${HOME}/.config/rclone/rclone.conf"
 CONF_FILE="/etc/vps-backup.conf"
 
-# GitHub file paths inside your repo
 GH_ENCRYPTED_CONF="backup-config/rclone.conf.enc"
 GH_SETTINGS="backup-config/settings.conf"
 GH_SCRIPT="vps_backup_setup.sh"
@@ -49,8 +50,29 @@ GH_SCRIPT="vps_backup_setup.sh"
 FROM_GITHUB=false
 [[ "${1:-}" == "--from-github" ]] && FROM_GITHUB=true
 
+# ── TTY-safe read helper ──────────────────────────────────────────────────────
+# When script is piped through curl, stdin is the pipe not the terminal.
+# We force reads from /dev/tty so interactive prompts always work.
+ask() {
+    # ask <varname> <prompt> [default]
+    local _VAR="$1" _PROMPT="$2" _DEFAULT="${3:-}" _VAL
+    printf "%s" "${_PROMPT}" > /dev/tty
+    read -r _VAL < /dev/tty
+    _VAL="${_VAL:-${_DEFAULT}}"
+    printf -v "${_VAR}" '%s' "${_VAL}"
+}
+
+ask_secret() {
+    # ask_secret <varname> <prompt>
+    local _VAR="$1" _PROMPT="$2" _VAL
+    printf "%s" "${_PROMPT}" > /dev/tty
+    read -rs _VAL < /dev/tty
+    echo "" > /dev/tty
+    printf -v "${_VAR}" '%s' "${_VAL}"
+}
+
 # ==============================================================================
-#  STEP 1 — Install dependencies (rclone + openssl + git)
+#  STEP 1 — Install dependencies
 # ==============================================================================
 banner "1/6  Installing dependencies"
 
@@ -62,7 +84,6 @@ else
     ok "rclone installed"
 fi
 
-# openssl is needed to encrypt/decrypt the rclone config
 if ! command -v openssl &>/dev/null; then
     info "Installing openssl…"
     apt-get install -y openssl 2>/dev/null || yum install -y openssl 2>/dev/null || true
@@ -76,44 +97,46 @@ fi
 ok "git ready"
 
 # ==============================================================================
-#  STEP 2 — GitHub setup (public repo, no token needed)
+#  STEP 2 — GitHub repo details
 # ==============================================================================
 banner "2/6  GitHub setup"
 
-echo -e "  Your rclone config will be ${B}encrypted${X} with a password you choose,"
-echo -e "  then stored in a ${B}public${X} GitHub repo — no token needed."
-echo -e "  The encrypted file is useless to anyone without your password."
-echo ""
-
-read -rp "  GitHub username: " GH_USER
-echo ""
-read -rp "  Repo name (will be created if it doesn't exist) [vps-backup-config]: " GH_REPO
-GH_REPO="${GH_REPO:-vps-backup-config}"
-echo ""
+if [[ "${FROM_GITHUB}" == "true" ]]; then
+    # Pull GH_USER and GH_REPO from the baked-in settings if available
+    if [[ -f "${CONF_FILE}" ]]; then
+        # shellcheck disable=SC1090
+        source "${CONF_FILE}"
+        ok "Loaded saved settings — ${GH_USER}/${GH_REPO}"
+    else
+        # Ask from /dev/tty (works even with curl pipe)
+        echo -e "  Enter your GitHub details to pull your config." > /dev/tty
+        ask GH_USER "  GitHub username: "
+        ask GH_REPO "  Repo name [vps-backup-config]: " "vps-backup-config"
+    fi
+else
+    echo -e "  Your rclone config will be ${B}AES-256 encrypted${X} and pushed to a public GitHub repo." > /dev/tty
+    echo -e "  Nobody can use the encrypted file without your password.\n" > /dev/tty
+    ask GH_USER "  GitHub username: "
+    ask GH_REPO "  Repo name [vps-backup-config]: " "vps-backup-config"
+fi
 
 GH_RAW="https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/main"
 GH_API="https://api.github.com"
 
 if [[ "${FROM_GITHUB}" == "false" ]]; then
-    # ── Check if repo exists ──────────────────────────────────────────────────
     HTTP=$(curl -s -o /dev/null -w "%{http_code}" "${GH_API}/repos/${GH_USER}/${GH_REPO}")
-
     if [[ "${HTTP}" == "200" ]]; then
         ok "Repo found: github.com/${GH_USER}/${GH_REPO}"
     elif [[ "${HTTP}" == "404" ]]; then
-        echo -e "  ${Y}Repo '${GH_REPO}' not found on GitHub.${X}"
-        echo -e "  Please create it manually at: ${C}https://github.com/new${X}"
-        echo -e "  • Name: ${B}${GH_REPO}${X}"
-        echo -e "  • Visibility: ${B}Public${X}"
-        echo -e "  • Tick: ${B}Add a README file${X}  (so the repo isn't empty)"
-        echo ""
-        read -rp "  Press ENTER once you've created the repo…"
-        # Verify again
+        echo -e "\n  ${Y}Repo '${GH_REPO}' not found.${X}" > /dev/tty
+        echo -e "  Create it at: ${C}https://github.com/new${X}" > /dev/tty
+        echo -e "  → Name: ${B}${GH_REPO}${X}  → Public  → Tick 'Add README'\n" > /dev/tty
+        ask _DUMMY "  Press ENTER once the repo is created…"
         HTTP2=$(curl -s -o /dev/null -w "%{http_code}" "${GH_API}/repos/${GH_USER}/${GH_REPO}")
-        [[ "${HTTP2}" == "200" ]] || die "Still can't find repo. Check username/repo name and try again."
-        ok "Repo confirmed: github.com/${GH_USER}/${GH_REPO}"
+        [[ "${HTTP2}" == "200" ]] || die "Repo still not found. Check name and try again."
+        ok "Repo confirmed."
     else
-        die "GitHub returned HTTP ${HTTP}. Check your username and internet connection."
+        die "GitHub returned HTTP ${HTTP}. Check your username and internet."
     fi
 fi
 
@@ -122,80 +145,52 @@ fi
 # ==============================================================================
 banner "3/6  Encryption password"
 
-echo -e "  This password encrypts your rclone config before it goes to GitHub."
-echo -e "  ${B}Remember it — you'll need it on every new VPS.${X}"
-echo -e "  ${R}Do NOT lose it — there is no recovery.${X}"
-echo ""
+echo -e "  This password encrypts your rclone config stored on GitHub." > /dev/tty
+echo -e "  ${B}Remember it — you need it on every new VPS. No recovery possible.${X}\n" > /dev/tty
 
-while true; do
-    read -rsp "  Enter encryption password: " ENC_PASS; echo ""
-    read -rsp "  Confirm password:          " ENC_PASS2; echo ""
-    [[ "${ENC_PASS}" == "${ENC_PASS2}" ]] && break
-    warn "Passwords do not match — try again."
-done
-ok "Password set"
+if [[ "${FROM_GITHUB}" == "true" ]]; then
+    # Only ask once — we're just decrypting
+    ask_secret ENC_PASS "  Enter your encryption password: "
+    [[ -z "${ENC_PASS}" ]] && die "Password cannot be empty."
+    ok "Password received"
+else
+    # Ask twice to confirm
+    while true; do
+        ask_secret ENC_PASS  "  Enter encryption password:   "
+        ask_secret ENC_PASS2 "  Confirm encryption password: "
+        if [[ "${ENC_PASS}" == "${ENC_PASS2}" ]]; then
+            [[ -z "${ENC_PASS}" ]] && { warn "Password cannot be empty."; continue; }
+            break
+        fi
+        warn "Passwords do not match — try again."
+    done
+    ok "Password set"
+fi
 
 # ── encryption helpers ────────────────────────────────────────────────────────
-encrypt_file() {
-    # encrypt_file <input> <output.enc>
-    openssl enc -aes-256-cbc -pbkdf2 -iter 100000 \
-        -in "$1" -out "$2" -k "${ENC_PASS}"
-}
+encrypt_file() { openssl enc -aes-256-cbc -pbkdf2 -iter 100000 -in "$1" -out "$2" -k "${ENC_PASS}"; }
+decrypt_file() { openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 -in "$1" -out "$2" -k "${ENC_PASS}"; }
 
-decrypt_file() {
-    # decrypt_file <input.enc> <output>
-    openssl enc -d -aes-256-cbc -pbkdf2 -iter 100000 \
-        -in "$1" -out "$2" -k "${ENC_PASS}"
-}
-
-# ── GitHub file push via API (no token — uses git clone + push) ───────────────
-# We use a temp clone with HTTPS + GitHub token-free push via git credential
-# Since repo is public for READ, we only need auth for WRITE.
-# Solution: use git with a one-time token just for push, OR ask user to
-# paste a fine-grained token with Contents:write only.
-#
-# Better approach for truly no-token: use GitHub CLI or instruct user.
-# SIMPLEST true no-token write: git clone via SSH if key exists, else ask once.
-
+# ── git push helper ───────────────────────────────────────────────────────────
 push_to_github() {
-    local FILE_PATH="$1"   # local file
-    local REPO_PATH="$2"   # path inside repo
-    local MSG="$3"         # commit message
-
+    local FILE_PATH="$1" REPO_PATH="$2" MSG="$3"
     local TMP_REPO="/tmp/gh-backup-repo-$$"
     rm -rf "${TMP_REPO}"
 
-    # Try SSH first (works if user has SSH key on this VPS added to GitHub)
-    local SSH_OK=false
-    if ssh -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
-        SSH_OK=true
-    fi
-
-    if [[ "${SSH_OK}" == "true" ]]; then
-        git clone "git@github.com:${GH_USER}/${GH_REPO}.git" "${TMP_REPO}" -q
+    # Try SSH key first
+    if ssh -o BatchMode=yes -o ConnectTimeout=5 -T git@github.com 2>&1 | grep -q "successfully authenticated"; then
+        git clone "git@github.com:${GH_USER}/${GH_REPO}.git" "${TMP_REPO}" -q 2>/dev/null
     else
-        # Fall back: ask for a fine-grained token (Contents: Read+Write only)
-        # This is a one-time step saved nowhere on disk
-        echo ""
-        echo -e "  ${Y}To push files to GitHub, a write token is needed once.${X}"
-        echo -e "  Create a fine-grained token at:"
-        echo -e "  ${C}https://github.com/settings/personal-access-tokens/new${X}"
-        echo ""
-        echo -e "  Settings:"
-        echo -e "    • Repository access → Only select: ${B}${GH_REPO}${X}"
-        echo -e "    • Permissions → Contents: ${B}Read and Write${X}  (nothing else)"
-        echo -e "    • Expiration: ${B}No expiration${X} (or 1 year)"
-        echo ""
-        echo -e "  This token is ${B}not saved anywhere${X} — used only right now to push."
-        echo ""
-        read -rsp "  Paste token: " GH_WRITE_TOKEN; echo ""
+        echo -e "\n  ${Y}A one-time write token is needed to push to GitHub.${X}" > /dev/tty
+        echo -e "  Create one at: ${C}https://github.com/settings/tokens/new${X}" > /dev/tty
+        echo -e "  Scopes needed: tick ${B}repo${X} only. Expiry: No expiration.\n" > /dev/tty
+        ask_secret GH_WRITE_TOKEN "  Paste token: "
         git clone "https://${GH_USER}:${GH_WRITE_TOKEN}@github.com/${GH_USER}/${GH_REPO}.git" \
-            "${TMP_REPO}" -q
+            "${TMP_REPO}" -q 2>/dev/null
     fi
 
     mkdir -p "${TMP_REPO}/$(dirname "${REPO_PATH}")"
     cp "${FILE_PATH}" "${TMP_REPO}/${REPO_PATH}"
-
     cd "${TMP_REPO}"
     git config user.email "backup@vps"
     git config user.name "VPS Backup"
@@ -204,59 +199,62 @@ push_to_github() {
     git push -q
     cd - > /dev/null
     rm -rf "${TMP_REPO}"
+    unset GH_WRITE_TOKEN 2>/dev/null || true
 }
 
 # ==============================================================================
-#  STEP 4 — rclone remote  (configure fresh OR restore from GitHub)
+#  STEP 4 — rclone remote
 # ==============================================================================
 banner "4/6  rclone remote"
 
 mkdir -p "$(dirname "${RCLONE_CONF}")"
 
 if [[ "${FROM_GITHUB}" == "true" ]]; then
-    # ── Restore encrypted config from GitHub ─────────────────────────────────
     info "Downloading encrypted rclone config from GitHub…"
     ENC_TMP=$(mktemp)
-    curl -fsSL "${GH_RAW}/${GH_ENCRYPTED_CONF}" -o "${ENC_TMP}"
+    if ! curl -fsSL "${GH_RAW}/${GH_ENCRYPTED_CONF}" -o "${ENC_TMP}" 2>/dev/null; then
+        rm -f "${ENC_TMP}"
+        die "Could not download encrypted config from GitHub. Check repo name and username."
+    fi
 
-    info "Decrypting…"
-    if ! decrypt_file "${ENC_TMP}" "${RCLONE_CONF}"; then
+    info "Decrypting rclone config…"
+    if ! decrypt_file "${ENC_TMP}" "${RCLONE_CONF}" 2>/dev/null; then
         rm -f "${ENC_TMP}"
         die "Decryption failed — wrong password?"
     fi
     rm -f "${ENC_TMP}"
     chmod 600 "${RCLONE_CONF}"
-    ok "rclone config restored and decrypted"
+    ok "rclone config restored"
 
-    # Restore settings
-    info "Downloading settings from GitHub…"
-    curl -fsSL "${GH_RAW}/${GH_SETTINGS}" -o "${CONF_FILE}"
+    info "Loading settings from GitHub…"
+    curl -fsSL "${GH_RAW}/${GH_SETTINGS}" -o "${CONF_FILE}" 2>/dev/null \
+        || die "Could not download settings from GitHub."
     # shellcheck disable=SC1090
     source "${CONF_FILE}"
     ok "Settings loaded — Remote: ${RCLONE_REMOTE}  Folder: ${BACKUP_FOLDER}"
 
 else
-    # ── Fresh rclone config ───────────────────────────────────────────────────
+    # ── Fresh rclone setup ────────────────────────────────────────────────────
     EXISTING=$(rclone listremotes 2>/dev/null || true)
 
     if [[ -n "${EXISTING}" ]]; then
-        echo -e "  ${G}Existing remotes:${X}"
-        echo "${EXISTING}" | while read -r RM; do echo -e "    ${C}${RM}${X}"; done
-        echo ""
-        read -rp "  Use existing [u] or configure new [n]: " USE_EX
+        echo -e "\n  ${G}Existing remotes:${X}" > /dev/tty
+        echo "${EXISTING}" | while read -r RM; do echo -e "    ${C}${RM}${X}" > /dev/tty; done
+        echo "" > /dev/tty
+        ask USE_EX "  Use existing [u] or configure new [n]: "
         USE_EX="${USE_EX,,}"
     else
         USE_EX="n"
     fi
 
-    if [[ "${USE_EX:-n}" == "u" ]]; then
-        read -rp "  Remote name (without colon): " RCLONE_REMOTE
+    if [[ "${USE_EX}" == "u" ]]; then
+        ask RCLONE_REMOTE "  Remote name (without colon): "
         RCLONE_REMOTE="${RCLONE_REMOTE%:}"
         rclone listremotes | grep -q "^${RCLONE_REMOTE}:" || die "Remote not found."
         ok "Using: ${RCLONE_REMOTE}"
     else
-        echo -e "${Y}"
-        cat <<MSG
+        echo -e "${Y}" > /dev/tty
+        cat <<MSG > /dev/tty
   ╔════════════════════════════════════════════════════╗
   ║       rclone config — Google Drive setup           ║
   ╠════════════════════════════════════════════════════╣
@@ -270,8 +268,8 @@ else
   ║  8. Confirm → y   then   q   to quit               ║
   ╚════════════════════════════════════════════════════╝
 MSG
-        echo -e "${X}"
-        read -rp "  Press ENTER to open rclone config…"
+        echo -e "${X}" > /dev/tty
+        ask _DUMMY "  Press ENTER to open rclone config…"
         BEFORE=$(rclone listremotes 2>/dev/null || true)
         rclone config
         AFTER=$(rclone listremotes 2>/dev/null || true)
@@ -281,21 +279,19 @@ MSG
             RCLONE_REMOTE="${ADDED%%:*}"
             ok "Auto-detected remote: ${B}${RCLONE_REMOTE}${X}"
         else
-            read -rp "  Type the remote name you just created (without colon): " RCLONE_REMOTE
+            ask RCLONE_REMOTE "  Type the remote name you just created (without colon): "
             RCLONE_REMOTE="${RCLONE_REMOTE%:}"
         fi
         rclone listremotes | grep -q "^${RCLONE_REMOTE}:" || die "Remote not found."
     fi
 
-    # ── Backup folder name ────────────────────────────────────────────────────
-    echo ""
-    echo -e "  ${B}Top-level folder name in your Google Drive:${X}"
-    read -rp "  Press ENTER for [${RCLONE_REMOTE}-backups] or type custom: " BACKUP_FOLDER
-    BACKUP_FOLDER="${BACKUP_FOLDER:-${RCLONE_REMOTE}-backups}"
+    echo "" > /dev/tty
+    echo -e "  ${B}Top-level folder name in your Google Drive:${X}" > /dev/tty
+    ask BACKUP_FOLDER "  Press ENTER for [${RCLONE_REMOTE}-backups] or type custom: " "${RCLONE_REMOTE}-backups"
     BACKUP_FOLDER="${BACKUP_FOLDER// /-}"
     ok "Backup folder: ${B}${BACKUP_FOLDER}${X}"
 
-    # ── Save settings file ────────────────────────────────────────────────────
+    # Save settings
     cat > "${CONF_FILE}" <<CONF
 RCLONE_REMOTE="${RCLONE_REMOTE}"
 BACKUP_FOLDER="${BACKUP_FOLDER}"
@@ -303,24 +299,30 @@ GH_USER="${GH_USER}"
 GH_REPO="${GH_REPO}"
 CONF
 
-    # ── Encrypt rclone config and push to GitHub ──────────────────────────────
+    # Encrypt and push rclone config
     info "Encrypting rclone config…"
     ENC_TMP=$(mktemp)
     encrypt_file "${RCLONE_CONF}" "${ENC_TMP}"
-    ok "Encrypted: $(du -sh "${ENC_TMP}" | cut -f1)"
+    ok "Encrypted ($(du -sh "${ENC_TMP}" | cut -f1))"
 
     info "Pushing encrypted config to GitHub…"
     push_to_github "${ENC_TMP}" "${GH_ENCRYPTED_CONF}" "Update encrypted rclone config"
     rm -f "${ENC_TMP}"
-    ok "Encrypted config pushed to GitHub"
+    ok "Config pushed"
 
     info "Pushing settings to GitHub…"
-    push_to_github "${CONF_FILE}" "${GH_SETTINGS}" "Update backup settings"
-    ok "Settings pushed to GitHub"
+    push_to_github "${CONF_FILE}" "${GH_SETTINGS}" "Update settings"
+    ok "Settings pushed"
 
     info "Pushing setup script to GitHub…"
-    push_to_github "$0" "${GH_SCRIPT}" "Update setup script"
-    ok "Setup script pushed to GitHub"
+    # Script was saved to a temp file since we came through curl
+    SCRIPT_PATH="${BASH_SOURCE[0]:-$0}"
+    if [[ -f "${SCRIPT_PATH}" ]]; then
+        push_to_github "${SCRIPT_PATH}" "${GH_SCRIPT}" "Update setup script"
+        ok "Setup script pushed"
+    else
+        warn "Cannot push setup script (piped from curl — download and push manually)"
+    fi
 fi
 
 # ==============================================================================
@@ -360,7 +362,7 @@ mkdir -p "${STAGING}"
 
 cat > "${BACKUP_SCRIPT}" <<SCRIPT
 #!/usr/bin/env bash
-# Auto-generated by vps_backup_setup.sh v4 — do not edit by hand
+# Auto-generated by vps_backup_setup.sh v5 — do not edit by hand
 set -euo pipefail
 
 REMOTE="${RCLONE_REMOTE}"
@@ -377,7 +379,6 @@ WINGS_CONFIG="${WINGS_CONFIG}"
 WINGS_DATA="${WINGS_DATA}"
 WINGS_VOLUMES="${WINGS_VOLUMES}"
 
-# ── helpers ───────────────────────────────────────────────────────────────────
 log()  { echo "[\$(date '+%H:%M:%S')] [INFO]  \$*"; }
 warn() { echo "[\$(date '+%H:%M:%S')] [WARN]  \$*"; }
 ok()   { echo "[\$(date '+%H:%M:%S')] [OK]    \$*"; }
@@ -402,33 +403,26 @@ rotate() {
         log "  Rotating — deleting \${EXCESS} oldest, keeping \${KEEP}"
         echo "\${FILES}" | head -n "\${EXCESS}" | while read -r OLD; do
             [[ -z "\${OLD}" ]] && continue
-            log "    ✗ \${OLD}"
-            rclone deletefile "\${REMOTE}:\${BACKUP_FOLDER}/\${DEST}/\${OLD}" && \
-                ok "    Deleted: \${OLD}" || warn "    Failed to delete: \${OLD}"
+            rclone deletefile "\${REMOTE}:\${BACKUP_FOLDER}/\${DEST}/\${OLD}" \
+                && ok "  ✗ Deleted: \${OLD}" \
+                || warn "  Failed to delete: \${OLD}"
         done
     else
-        log "  \${DEST}/ has \${COUNT}/\${KEEP} backups — no rotation needed"
+        log "  \${DEST}/ — \${COUNT}/\${KEEP} backups, no rotation needed"
     fi
 }
 
-pack() {
-    local OUT="\$1"; shift
-    tar --ignore-failed-read -czf "\${OUT}" "\$@" 2>/dev/null || true
-}
+pack()   { local OUT="\$1"; shift; tar --ignore-failed-read -czf "\${OUT}" "\$@" 2>/dev/null || true; }
 
 upload() {
     local ARC="\$1" DEST="\$2"
-    local SZ; SZ=\$(du -sh "\${ARC}" | cut -f1)
-    log "  Uploading \$(basename "\${ARC}") (\${SZ})…"
-    rclone copy "\${ARC}" "\${REMOTE}:\${BACKUP_FOLDER}/\${DEST}/" \
-        --stats 30s --log-level NOTICE
+    log "  Uploading \$(basename "\${ARC}") (\$(du -sh "\${ARC}" | cut -f1))…"
+    rclone copy "\${ARC}" "\${REMOTE}:\${BACKUP_FOLDER}/\${DEST}/" --stats 30s --log-level NOTICE
     rm -f "\${ARC}"
     ok "  ✔ \${BACKUP_FOLDER}/\${DEST}/\$(basename "\${ARC}")"
 }
 
-# ── main ──────────────────────────────────────────────────────────────────────
 exec >> "\${LOG}" 2>&1
-
 mkdir -p "\${STAGING}"
 DATE=\$(date '+%Y-%m-%d')
 TIME=\$(date '+%H-%M')
@@ -495,8 +489,7 @@ if [[ "\${HAS_WINGS}" == "true" ]]; then
     if [[ -d "\${WINGS_DATA}" ]]; then
         NUM=\$(next_num "wings" "wings")
         ARC="\${STAGING}/wings_\${NUM}_\${DATE}_\${TIME}.tar.gz"
-        tar --ignore-failed-read -czf "\${ARC}" \
-            --exclude="\${WINGS_VOLUMES}" "\${WINGS_DATA}" 2>/dev/null || true
+        tar --ignore-failed-read -czf "\${ARC}" --exclude="\${WINGS_VOLUMES}" "\${WINGS_DATA}" 2>/dev/null || true
         upload "\${ARC}" "wings"
         rotate "wings" "wings"
     else
@@ -540,7 +533,7 @@ SCRIPT
 chmod +x "${BACKUP_SCRIPT}"
 ok "Worker written to ${BACKUP_SCRIPT}"
 
-# ── systemd service ───────────────────────────────────────────────────────────
+# ── systemd ───────────────────────────────────────────────────────────────────
 cat > "/etc/systemd/system/${SVC}.service" <<SVC_EOF
 [Unit]
 Description=VPS + Pterodactyl Backup → ${RCLONE_REMOTE}:${BACKUP_FOLDER}
@@ -555,7 +548,6 @@ StandardError=journal
 TimeoutStartSec=21600
 SVC_EOF
 
-# OnCalendar = fixed wall-clock times, nothing can break it
 cat > "/etc/systemd/system/${SVC}.timer" <<TMR_EOF
 [Unit]
 Description=VPS Backup every 3 hours
@@ -572,7 +564,6 @@ TMR_EOF
 
 systemctl daemon-reload
 systemctl enable --now "${SVC}.timer"
-
 NEXT=$(systemctl list-timers "${SVC}.timer" --no-pager 2>/dev/null \
     | grep "${SVC}" | awk '{print $1,$2,$3}' || true)
 ok "Timer active — next run: ${NEXT}"
@@ -593,16 +584,13 @@ echo -e "  ${B}Remote  :${X} ${C}${RCLONE_REMOTE}${X}"
 echo -e "  ${B}Folder  :${X} ${C}${BACKUP_FOLDER}/${X}"
 echo -e "  ${B}Schedule:${X} 00:00  03:00  06:00  09:00  12:00  15:00  18:00  21:00 UTC"
 echo -e "  ${B}Keep    :${X} Last ${KEEP} per category — oldest auto-deleted"
+echo -e "  ${B}GitHub  :${X} ${C}github.com/${GH_USER}/${GH_REPO}${X}"
 echo ""
-echo -e "  ${B}GitHub  :${X} ${C}github.com/${GH_USER}/${GH_REPO}${X} (public, config is encrypted)"
+echo -e "  ${B}━━━━━━  On any NEW VPS — just run: ━━━━━━${X}"
 echo ""
-echo -e "  ${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${X}"
-echo -e "  ${B}On a NEW VPS — just run this one command:${X}"
-echo -e ""
-echo -e "  ${C}curl -fsSL https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/main/vps_backup_setup.sh | sudo bash -s -- --from-github${X}"
-echo -e ""
+echo -e "  ${C}curl -fsSL https://raw.githubusercontent.com/${GH_USER}/${GH_REPO}/main/vps_backup_setup.sh -o setup.sh && sudo bash setup.sh --from-github${X}"
+echo ""
 echo -e "  ${Y}It will ask for your encryption password — that's it.${X}"
-echo -e "  ${B}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${X}"
 echo ""
 echo -e "  ${B}Commands:${X}"
 echo -e "    Live log  →  ${C}journalctl -u ${SVC} -f${X}"
