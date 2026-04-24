@@ -43,37 +43,6 @@ your-backup-folder/
 
 ---
 
-## 🚀 First Time Setup
-
-### 1. Create a public GitHub repo
-
-Go to [github.com/new](https://github.com/new) and create a repo:
-- Name: `vps-backup-config` (or anything you like)
-- Visibility: **Public**
-- Tick **"Add a README file"** so it isn't empty
-
-### 2. Run the setup script on your VPS
-
-```bash
-sudo bash vps_backup_setup.sh
-```
-
-The script will ask you for:
-- Your **GitHub username** and **repo name**
-- An **encryption password** — this encrypts your rclone config before it goes to GitHub. **Remember it, there is no recovery.**
-- **rclone config** — it opens interactively, you sign into Google Drive
-- A **one-time write token** to push files to your GitHub repo
-
-> ⚠️ The write token is used once to push your config files and is never saved to disk.
-> Create it at: [github.com/settings/personal-access-tokens/new](https://github.com/settings/personal-access-tokens/new)
-> Settings: Repository → `vps-backup-config` | Permission → Contents: **Read and Write** only
-
-### 3. Done
-
-The first backup runs immediately. Every 3 hours after that it runs automatically.
-
----
-
 ## ⚡ New VPS Setup (30 seconds)
 
 On any new VPS, just run this one command:
