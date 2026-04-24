@@ -79,7 +79,7 @@ The first backup runs immediately. Every 3 hours after that it runs automaticall
 On any new VPS, just run this one command:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/vps_backup_setup.sh | sudo bash -s -- --from-github
+curl -fsSL https://raw.githubusercontent.com/HemanRathore/autobackup/main/vps_backup_setup.sh | sudo bash -s -- --from-github
 ```
 
 It will:
